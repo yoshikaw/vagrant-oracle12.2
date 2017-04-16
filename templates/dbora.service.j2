@@ -1,0 +1,13 @@
+[Unit]
+Description=Oracle database server
+After=network.target
+
+[Service]
+Type=forking
+EnvironmentFile=/etc/sysconfig/oracledb
+ExecStart={{ oracle_home }}/bin/dbstart $ORACLE_HOME
+ExecStop={{ oracle_home }}/bin/dbshut $ORACLE_HOME
+User=oracle
+
+[Install]
+WantedBy=multi-user.target

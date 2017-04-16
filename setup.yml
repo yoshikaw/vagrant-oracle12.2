@@ -1,0 +1,199 @@
+---
+- name: Setup Oracle Database 12.2 Single Node on Oracle Linux
+  hosts: default
+  become: true
+
+  vars:
+    script_dir: "{{ playbook_dir }}"
+    oracle_base: "/u01/app/oracle"
+    oracle_home: "/u01/app/oracle/product/12.2.0.1/dbhome_1"
+
+  tasks:
+    # netca requires domain name
+    - name: Set hostname
+      hostname:
+        name: localhost.localdomain
+
+    - name: Install rlwrap
+      yum:
+        name: "{{ item.name }}"
+      with_items:
+        # use hash to prevent sequence optimization
+        - name: "https://dl.fedoraproject.org/pub/epel/epel-release-latest-{{ ansible_distribution_major_version }}.noarch.rpm"
+        - name: rlwrap
+
+    - name: Install other utility packages
+      yum:
+        name: "{{ item }}"
+      with_items:
+        - vim-enhanced
+        - emacs
+        - screen
+        - tmux
+
+    - name: Install Oracle Preinstallation RPM
+      yum:
+        name: oracle-database-server-12cR2-preinstall
+      register: ora_preinstall
+
+    - name: Create Operating System Privileges Groups
+      group:
+         gid: "{{ item.gid }}"
+         name: "{{ item.name }}"
+      with_items:
+        - { gid: 54324, name: backupdba }
+        - { gid: 54325, name: dgdba }
+        - { gid: 54326, name: kmdba }
+        - { gid: 54327, name: racdba }
+
+    - name: Modify oracle user's auxiliary group
+      user:
+        name: oracle
+        groups: dba,backupdba,dgdba,kmdba,racdba
+        append: yes
+
+    - name: Create directories
+      file:
+        dest: "{{ item.dest }}"
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+        state: directory
+      with_items:
+        - { dest: /u01, owner: root, group: root, mode: '0755' }
+        - { dest: /u01/app, owner: oracle, group: oinstall, mode: '0775' }
+
+    - name: Set oracle user's environment variables
+      blockinfile:
+        dest: /home/oracle/.bash_profile
+        block: |-
+          export ORACLE_BASE=/u01/app/oracle
+          export ORACLE_HOME={{ oracle_home }}
+          export ORACLE_SID=orcl
+          export PATH=$PATH:$ORACLE_HOME/bin
+          export JAVA_HOME=$ORACLE_HOME/jdk
+
+    - name: Set oracle user's alias
+      blockinfile:
+        dest: /home/oracle/.bashrc
+        block: |-
+          alias sqlplus='rlwrap sqlplus'
+          alias rman='rlwrap rman'
+          alias sql='$ORACLE_HOME/sqldeveloper/sqlcl/bin/sql'
+
+    - name: Set oracle user's password
+      user:
+        name: oracle
+        password: "{{ 'oracle'|password_hash('sha256', 'mysecret') }}"
+
+    - name: Install Oracle Database Software
+      become_user: oracle
+      command: >-
+        {{ script_dir }}/database/runInstaller
+        -silent
+        -showProgress
+        -ignorePrereq
+        -waitforcompletion
+        -responseFile {{ script_dir }}/db_install.rsp
+      args:
+        creates: "{{ oracle_home }}/bin/oracle"
+      register: runInstaller
+      failed_when:
+        - runInstaller.changed
+        - "'Successfully Setup Software.' not in runInstaller.stdout"
+
+    - name: Display runInstaller output
+      debug: var=runInstaller
+      when: runInstaller.changed
+
+    - name: Execute post installation scripts
+      command: "{{ item.command }}"
+      args:
+        creates: "{{ item.creates }}"
+      register: postscript
+      with_items:
+        - command: /u01/app/oraInventory/orainstRoot.sh
+          creates: /etc/oraInst.loc
+        - command: "{{ oracle_home }}/root.sh"
+          creates: /tmp/.oracle
+
+    - name: Display post installation script output
+      debug:
+        var: "{{ item }}"
+      with_items:
+        - postscript.results[0].stdout_lines
+        - postscript.results[1].stdout_lines
+      when: postscript.changed
+
+    - name: Create listener
+      become_user: oracle
+      command: >-
+        {{ oracle_home }}/bin/netca
+        -silent
+        -responseFile {{ oracle_home }}/assistants/netca/netca.rsp
+      args:
+        creates: "{{ oracle_home }}/network/admin/listener.ora"
+      register: netca
+
+    - name: Display netca output
+      debug: var=netca.stdout_lines
+      when: netca.changed
+
+    - name: Create database
+      become_user: oracle
+      command: >-
+        {{ oracle_home }}/bin/dbca
+        -silent
+        -createDatabase
+        -responseFile {{ script_dir }}/dbca.rsp
+      args:
+        creates: /u01/app/oracle/cfgtoollogs/dbca/orcl/orcl.log
+      register: dbca
+
+    - name: Display dbca output
+      debug: var=dbca.stdout_lines
+      when: dbca.changed
+
+    - name: Configure pluggable database open mode
+      become_user: oracle
+      command: bash -l -c "echo 'alter pluggable database pdb1 save state;' | sqlplus / as sysdba"
+      when: dbca.changed # and db.version >= 12.1.0.2
+
+    - name: Setup service configuration file
+      template:
+        src: oracledb.j2
+        dest: /etc/sysconfig/oracledb
+
+    - name: Configure oratab
+      replace:
+        dest: /etc/oratab
+        regexp: '^(orcl:{{ oracle_home }}:)[^Y]$'
+        replace: '\1Y'
+
+    - name: Configure service
+      template:
+        src: dbora.service.j2
+        dest: /etc/systemd/system/dbora.service
+      when: ansible_distribution_major_version == '7'
+
+    - name: Configure service
+      template:
+        src: dbora.j2
+        dest: /etc/init.d/dbora
+        group: dba
+        mode: 0750
+      when: ansible_distribution_major_version == '6'
+
+    - name: Enable service
+      service:
+        name: "{{ item }}"
+        enabled: yes
+      with_items:
+        - dbora
+
+    - name: Allow to execute SQLcl
+      file:
+        dest: "{{ item }}"
+        mode: 0755
+      with_items:
+        - "{{ oracle_home }}/sqldeveloper/sqlcl/bin/sql"
